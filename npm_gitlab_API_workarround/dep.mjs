@@ -1,7 +1,6 @@
       import { readFile } from "node:fs/promises";
 
       const { GITLAB_TOKEN, CI_API_V4_URL, CI_PROJECT_ID, CI_MERGE_REQUEST_IID } = process.env;
-      const REGISTRY = process.env.NPM_REGISTRY || "https://registry.npmjs.org";
       const MARKER = "<!-- npm-deprecations -->";
       const MR = `${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}`;
 
@@ -11,28 +10,20 @@
           headers: { "PRIVATE-TOKEN": GITLAB_TOKEN, "content-type": "application/json" },
         }).then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status} on ${path}`))));
 
-      const lock = JSON.parse(await readFile("package-lock.json", "utf8"));
-      const pkgs = [
-        ...new Map(
-          Object.entries(lock.packages)
-            .filter(([k, v]) => k && !v.link && v.version)
-            .map(([k, v]) => [`${v.name || k.split("node_modules/").pop()}@${v.version}`,
-                              { name: v.name || k.split("node_modules/").pop(), version: v.version }])
-        ).values(),
-      ];
-
-      const found = [];
-      const check = async ({ name, version }) => {
-        const r = await fetch(`${REGISTRY}/${name.replace("/", "%2f")}/${version}`);
-        if (!r.ok) return;
-        const { deprecated } = await r.json();
-        if (deprecated) found.push(`- \`${name}@${version}\` — ${deprecated}`);
-      };
-      // Chunked so we don't open a socket per package on a big lockfile.
-      for (let i = 0; i < pkgs.length; i += 20) await Promise.all(pkgs.slice(i, i + 20).map(check));
+      // npm 10 prints "npm warn deprecated", npm 9 and earlier "npm WARN deprecated".
+      const log = await readFile("/tmp/npm.log", "utf8");
+      const found = [
+        ...new Set(
+          log
+            .split("\n")
+            .map((l) => l.match(/^npm\s+warn\s+deprecated\s+(\S+):\s*(.*)$/i))
+            .filter(Boolean)
+            .map(([, spec, msg]) => `- \`${spec}\` — ${msg.trim()}`)
+        ),
+      ].sort();
 
       const body = `${MARKER}\n### npm deprecations (${found.length})\n\n${
-        found.sort().join("\n") || "None. :white_check_mark:"
+        found.join("\n") || "None. :white_check_mark:"
       }`;
 
       const mine = (await api("/notes?per_page=100")).find((n) => n.body?.includes(MARKER));
@@ -40,4 +31,4 @@
         method: mine ? "PUT" : "POST",
         body: JSON.stringify({ body }),
       });
-      console.log(`${pkgs.length} checked, ${found.length} deprecated`);
+      console.log(`${found.length} deprecated`);
