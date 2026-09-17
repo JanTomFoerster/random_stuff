@@ -1,6 +1,7 @@
       import { readFile } from "node:fs/promises";
 
       const { GITLAB_TOKEN, CI_API_V4_URL, CI_PROJECT_ID, CI_MERGE_REQUEST_IID } = process.env;
+      console.log("GITLAB_TOKEN present:", !!GITLAB_TOKEN, "length:", GITLAB_TOKEN?.length ?? 0);
       const REGISTRY = process.env.NPM_REGISTRY || "https://registry.npmjs.org";
       const MARKER = "<!-- npm-deprecations -->";
       const MR = `${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}`;
