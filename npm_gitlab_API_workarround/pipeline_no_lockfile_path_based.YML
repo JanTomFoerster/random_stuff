@@ -1,0 +1,17 @@
+# Minimal pipeline: reports npm deprecation warnings as an MR note.
+# No lockfile required (uses `npm install`, not `npm ci`).
+# Assumes dep.mjs is committed in this repo at ci/dep.mjs — adjust the path below if not.
+
+npm-deprecations:
+  stage: test
+  image: cgr.dev/chainguard/node:latest-dev
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  variables:
+    NODE_EXTRA_CA_CERTS: "$GITLAB_CA_CERT"   # drop if GitLab uses a public CA
+  script:
+    # npm writes deprecation warnings to stderr. Capture them, but still show
+    # the output in the job log and still fail the job if install fails.
+    - npm install --no-audit --no-fund 2>/tmp/npm.log || { cat /tmp/npm.log; exit 1; }
+    - cat /tmp/npm.log
+    - node ci/dep.mjs --log /tmp/npm.log --format npm --marker npm-deprecations --title "npm deprecations"
