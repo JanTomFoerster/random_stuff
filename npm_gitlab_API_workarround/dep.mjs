@@ -29,7 +29,7 @@ if (!CI_MERGE_REQUEST_IID) die("not a merge-request pipeline, nothing to comment
 
 const MR = `${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}`;
 const title = args.title ?? args.marker;
-// Invisible HTML comment that lets a re-run recognise its own notes.
+// Invisible HTML comment that lets a re-run recognise notes left by an earlier run.
 const tag = (suffix = "") => `<!-- ${args.marker}${suffix} -->`;
 
 const api = async (path, init) => {
@@ -41,8 +41,8 @@ const api = async (path, init) => {
   return r.json();
 };
 
-// per_page tops out at 100, so walk every page — otherwise a busy MR hides our
-// own marker behind page 1 and we post duplicates.
+// per_page tops out at 100, so walk every page — otherwise a busy MR hides the
+// marker behind page 1 and duplicates get posted.
 const apiAll = async (path) => {
   const out = [];
   for (let page = 1; ; page++) {
@@ -70,10 +70,10 @@ else await npmSummary(raw);
 // Create or rewrite the single MR note carrying this marker. An empty body
 // empties an existing note but never creates a new one.
 async function upsertNote(mark, body) {
-  const mine = (await apiAll("/notes")).find((n) => n.body?.includes(mark));
-  if (!mine && !body) return;
-  await api(mine ? `/notes/${mine.id}` : "/notes", {
-    method: mine ? "PUT" : "POST",
+  const existing = (await apiAll("/notes")).find((n) => n.body?.includes(mark));
+  if (!existing && !body) return;
+  await api(existing ? `/notes/${existing.id}` : "/notes", {
+    method: existing ? "PUT" : "POST",
     body: JSON.stringify({ body: `${mark}\n${body || "None. :white_check_mark:"}` }),
   });
 }
@@ -94,13 +94,13 @@ async function npmSummary(log) {
   console.log(`${found.length} deprecation(s) reported`);
 }
 
-// One inline diff comment per cluster of nearby findings, skipping clusters we
-// have already commented on. GitLab will only anchor to a line inside the MR's
+// One inline diff comment per cluster of nearby findings, skipping clusters
+// already commented on. GitLab will only anchor to a line inside the MR's
 // hunks, so findings elsewhere in a changed file are collected into one note
 // instead.
 async function eslintComments(json) {
   const results = json.trim() ? JSON.parse(json) : []; // eslint may have died before writing
-  // This script usually lives in the repo it is linting, so skip its own file.
+  // This file usually lives in the repo being linted, so exclude it.
   const self = relative(process.cwd(), fileURLToPath(import.meta.url)).replaceAll("\\", "/");
   const files = await diffFiles();
   const { base_sha, start_sha, head_sha } = (await api("")).diff_refs;
@@ -216,11 +216,11 @@ function cluster(lines, src) {
   return groups;
 }
 
-// Heuristic: a closing brace or a declaration at column 0 ends whatever function
-// we were in, so findings either side of it are not really neighbours and
-// merging them would be misleading. This also stops top-level findings from
-// being merged at all, which is what we want. Without the source file (it was
-// linted but not readable here) we fall back to distance alone.
+// Heuristic: a closing brace or a declaration at column 0 ends the enclosing
+// function, so findings either side of it are not really neighbours and merging
+// them would be misleading. This also stops top-level findings from being
+// merged at all, which is the intended behaviour. Without the source file (it
+// was linted but is not readable here) distance alone decides.
 function boundaryBetween(src, from, to) {
   if (!src) return false;
   for (let l = from + 1; l <= to; l++) {
@@ -271,16 +271,16 @@ async function diffFiles() {
   return map;
 }
 
-// Resolve the threads we opened for findings that are now gone. Only threads
-// carrying our marker are touched, so a reviewer's own comments are never
-// affected, and resolving keeps the thread and any replies on it.
+// Resolve threads opened for findings that are now gone. Only threads carrying
+// the marker are touched, so unrelated comments are never affected, and
+// resolving keeps the thread and any replies on it.
 async function reconcile(discussions, live) {
-  const ours = new RegExp(`<!--\\s*${escapeRe(args.marker)}:(\\S+?)\\s*-->`);
+  const marked = new RegExp(`<!--\\s*${escapeRe(args.marker)}:(\\S+?)\\s*-->`);
   let closed = 0;
   for (const d of discussions) {
     const first = d.notes?.[0];
-    const key = first?.body?.match(ours)?.[1];
-    if (!key || key === "unplaced") continue; // not ours, or the summary note
+    const key = first?.body?.match(marked)?.[1];
+    if (!key || key === "unplaced") continue; // unmarked, or the summary note
     if (live.has(key)) continue; // the finding is still there
     if (!first.resolvable || d.notes.every((n) => n.resolved)) continue;
     await api(`/discussions/${d.id}`, { method: "PUT", body: JSON.stringify({ resolved: true }) });
