@@ -1,35 +1,140 @@
-      import { readFile } from "node:fs/promises";
+// Post npm-deprecation or ESLint findings onto a GitLab MR, using only Node's
+// built-in fetch — for runners that have no curl.
+import { readFile } from "node:fs/promises";
+import { relative } from "node:path";
+import { parseArgs } from "node:util";
 
-      const { GITLAB_TOKEN, CI_API_V4_URL, CI_PROJECT_ID, CI_MERGE_REQUEST_IID } = process.env;
-      console.log("GITLAB_TOKEN present:", !!GITLAB_TOKEN, "length:", GITLAB_TOKEN?.length ?? 0);
-      const MARKER = "<!-- npm-deprecations -->";
-      const MR = `${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}`;
+const { values: args } = parseArgs({
+  options: {
+    log: { type: "string" },
+    format: { type: "string", default: "npm" },
+    marker: { type: "string" },
+    title: { type: "string" },
+  },
+});
 
-      const api = (path, init) =>
-        fetch(MR + path, {
-          ...init,
-          headers: { "PRIVATE-TOKEN": GITLAB_TOKEN, "content-type": "application/json" },
-        }).then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status} on ${path}`))));
+const die = (msg) => {
+  console.error(`dep.mjs: ${msg}`);
+  process.exit(1);
+};
 
-      // npm 10 prints "npm warn deprecated", npm 9 and earlier "npm WARN deprecated".
-      const log = await readFile("/tmp/npm.log", "utf8");
-      const found = [
-        ...new Set(
-          log
-            .split("\n")
-            .map((l) => l.match(/^npm\s+warn\s+deprecated\s+(\S+):\s*(.*)$/i))
-            .filter(Boolean)
-            .map(([, spec, msg]) => `- \`${spec}\` — ${msg.trim()}`)
-        ),
-      ].sort();
+if (!args.log) die("--log <file> is required");
+if (!args.marker) die("--marker <slug> is required");
 
-      const body = `${MARKER}\n### npm deprecations (${found.length})\n\n${
-        found.join("\n") || "None. :white_check_mark:"
-      }`;
+const { GITLAB_TOKEN, CI_API_V4_URL, CI_PROJECT_ID, CI_MERGE_REQUEST_IID } = process.env;
+if (!GITLAB_TOKEN) die("GITLAB_TOKEN is empty — is the CI variable protected while this branch is not?");
+if (!CI_MERGE_REQUEST_IID) die("not a merge-request pipeline, nothing to comment on");
 
-      const mine = (await api("/notes?per_page=100")).find((n) => n.body?.includes(MARKER));
-      await api(mine ? `/notes/${mine.id}` : "/notes", {
-        method: mine ? "PUT" : "POST",
-        body: JSON.stringify({ body }),
-      });
-      console.log(`${found.length} deprecated`);
+const MR = `${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}`;
+const title = args.title ?? args.marker;
+// Invisible HTML comment that lets a re-run recognise its own notes.
+const tag = (suffix = "") => `<!-- ${args.marker}${suffix} -->`;
+
+const api = async (path, init) => {
+  const r = await fetch(MR + path, {
+    ...init,
+    headers: { "PRIVATE-TOKEN": GITLAB_TOKEN, "content-type": "application/json" },
+  });
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText} on ${path}: ${await r.text()}`);
+  return r.json();
+};
+
+// per_page tops out at 100, so walk every page — otherwise a busy MR hides our
+// own marker behind page 1 and we post duplicates.
+const apiAll = async (path) => {
+  const out = [];
+  for (let page = 1; ; page++) {
+    const batch = await api(`${path}?per_page=100&page=${page}`);
+    out.push(...batch);
+    if (batch.length < 100) return out;
+  }
+};
+
+const raw = await readFile(args.log, "utf8");
+if (args.format === "eslint") await eslintComments(raw);
+else await npmSummary(raw);
+
+// A single note per MR, rewritten in place on every run.
+async function npmSummary(log) {
+  // npm 10 prints "npm warn deprecated", npm 9 and earlier "npm WARN deprecated".
+  const found = [
+    ...new Set(
+      log
+        .split("\n")
+        .map((l) => l.match(/^npm\s+warn\s+deprecated\s+(\S+):\s*(.*)$/i))
+        .filter(Boolean)
+        .map(([, spec, msg]) => `- \`${spec}\` — ${msg.trim()}`)
+    ),
+  ].sort();
+
+  const body = `${tag()}\n### ${title} (${found.length})\n\n${found.join("\n") || "None. :white_check_mark:"}`;
+  const mine = (await apiAll("/notes")).find((n) => n.body?.includes(tag()));
+  await api(mine ? `/notes/${mine.id}` : "/notes", {
+    method: mine ? "PUT" : "POST",
+    body: JSON.stringify({ body }),
+  });
+  console.log(`${found.length} deprecation(s) reported`);
+}
+
+// One inline diff comment per offending line, skipping lines already commented on.
+async function eslintComments(json) {
+  const results = json.trim() ? JSON.parse(json) : []; // eslint may have died before writing
+  const added = await addedLines();
+  const { base_sha, start_sha, head_sha } = (await api("")).diff_refs;
+  const seen = (await apiAll("/discussions")).flatMap((d) => d.notes.map((n) => n.body ?? ""));
+
+  const byLine = new Map();
+  let offDiff = 0;
+  for (const file of results) {
+    const path = relative(process.cwd(), file.filePath).replaceAll("\\", "/");
+    for (const m of file.messages) {
+      if (m.line == null) continue; // parse errors etc. have no line
+      // GitLab rejects a position outside the MR diff with a 400, so drop those
+      // instead of failing the job partway through.
+      if (!added.get(path)?.has(m.line)) {
+        offDiff++;
+        continue;
+      }
+      const key = `${path}:${m.line}`;
+      if (!byLine.has(key)) byLine.set(key, { path, line: m.line, key, messages: [] });
+      byLine.get(key).messages.push(m);
+    }
+  }
+
+  let posted = 0;
+  for (const { path, line, key, messages } of byLine.values()) {
+    if (seen.some((b) => b.includes(tag(`:${key}`)))) continue;
+    const body = `${tag(`:${key}`)}\n${title}:\n${messages
+      .map((m) => `- **${m.ruleId ?? "n/a"}**: ${m.message}`)
+      .join("\n")}`;
+    await api("/discussions", {
+      method: "POST",
+      body: JSON.stringify({
+        body,
+        position: { position_type: "text", base_sha, start_sha, head_sha, new_path: path, new_line: line },
+      }),
+    });
+    posted++;
+  }
+  console.log(`${byLine.size} line(s) in the diff with findings, ${posted} new comment(s), ${offDiff} finding(s) outside the diff`);
+}
+
+// new_path -> set of line numbers this MR adds; the only lines a "new_line"
+// position can anchor to.
+async function addedLines() {
+  const map = new Map();
+  for (const d of await apiAll("/diffs")) {
+    if (d.deleted_file || !d.diff) continue; // binary or too large to inline
+    const lines = new Set();
+    let n = 0;
+    for (const l of d.diff.split("\n")) {
+      const hunk = l.match(/^@@ -\d+(?:,\d+)? \+(\d+)/);
+      if (hunk) n = Number(hunk[1]);
+      else if (!l) continue; // trailing split artefact; a real blank line is " "
+      else if (l.startsWith("+")) lines.add(n++);
+      else if (!l.startsWith("-") && !l.startsWith("\\")) n++;
+    }
+    map.set(d.new_path, lines);
+  }
+  return map;
+}
